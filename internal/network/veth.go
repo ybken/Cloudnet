@@ -90,15 +90,27 @@ func CreateEndpoint(spec EndpointSpec) error {
 	if err := netlink.LinkSetAlias(peer, spec.Alias); err != nil {
 		return fail(fmt.Errorf("set peer veth %q ownership alias: %w", spec.PeerVethName, err))
 	}
-	if err := VerifyVethOwnership(host, spec.Alias); err != nil {
+	// Netlink setters do not update the LinkAttrs snapshot passed to them.
+	// Reload both ends so ownership checks observe what the kernel committed.
+	host, err = reloadOwnedVeth(spec.HostVethName, spec.Alias)
+	if err != nil {
+		return fail(err)
+	}
+	createdHost = host
+	peer, err = reloadOwnedVeth(spec.PeerVethName, spec.Alias)
+	if err != nil {
 		return fail(err)
 	}
 	if err := netlink.LinkSetNsFd(peer, int(netNS.Fd())); err != nil {
 		return fail(fmt.Errorf("move peer %q to netns %q: %w", spec.PeerVethName, spec.NetNSPath, err))
 	}
-	if err := VerifyVethOwnership(host, spec.Alias); err != nil {
+	// Moving the peer changes link state. Refresh the host again instead of
+	// relying on the pre-move snapshot for the destructive work that follows.
+	host, err = reloadOwnedVeth(spec.HostVethName, spec.Alias)
+	if err != nil {
 		return fail(err)
 	}
+	createdHost = host
 	if err := netlink.LinkSetMaster(host, bridge); err != nil {
 		return fail(fmt.Errorf("attach owned host veth %q to bridge %q: %w", spec.HostVethName, spec.BridgeName, err))
 	}
@@ -112,4 +124,28 @@ func CreateEndpoint(spec EndpointSpec) error {
 		return fail(fmt.Errorf("verify host endpoint after create: %w", err))
 	}
 	return nil
+}
+
+type linkLookupFunc func(string) (netlink.Link, bool, error)
+
+func reloadOwnedVeth(name, expectedAlias string) (netlink.Link, error) {
+	return reloadOwnedVethWith(name, expectedAlias, linkByName)
+}
+
+func reloadOwnedVethWith(
+	name string,
+	expectedAlias string,
+	lookup linkLookupFunc,
+) (netlink.Link, error) {
+	link, found, err := lookup(name)
+	if err != nil {
+		return nil, fmt.Errorf("reload veth %q after kernel update: %w", name, err)
+	}
+	if !found {
+		return nil, fmt.Errorf("veth %q is missing after kernel update", name)
+	}
+	if err := VerifyVethOwnership(link, expectedAlias); err != nil {
+		return nil, err
+	}
+	return link, nil
 }

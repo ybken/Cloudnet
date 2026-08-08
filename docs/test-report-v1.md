@@ -2,11 +2,11 @@
 
 ## 报告状态
 
-- 报告日期：2026-08-07
+- 报告日期：2026-08-08
 - 节点：`cloudnet-node-a`
 - 项目路径：`/home/cloudnet-template/src/cloudnet`
-- 当前结论：非特权单元、race、vet、build、VERSION 和脚本静态/权限保护验证已实际通过；需要 sudo 的安装、netns 集成、cnitool 和 nerdctl 功能验收尚未执行。
-- 阻塞原因：VM 上的 sudo 要求交互式密码，当前执行环境无法提供。`sudo make install` 在认证阶段退出，未修改系统目录。
+- 当前结论：非特权单元、race、vet、build、VERSION 和脚本静态/权限保护验证已实际通过。用户已实际完成一次 root 安装；两次特权 integration 都在 A/B 阶段失败，不能标记为通过。根因修复后的 binary 尚未重新安装和特权复测，cnitool 完整流程与 nerdctl 验收仍为 PENDING。
+- 特权边界：用户可在 VM 终端交互输入 sudo 密码；当前工具会话不能代替用户输入密码。因此本报告记录用户提供的 root 命令输出和随后完成的只读现场核验，不把未复跑的步骤推断为通过。
 - 额外探测：`unshare --user --map-root-user --net true` 因写入 `/proc/self/uid_map` 返回 `Operation not permitted`，因此也不能用隔离 user namespace 替代真实 root 验收。
 
 本报告只把实际运行过的命令标为通过。测试源码存在不等于特权场景已经验证。
@@ -27,10 +27,10 @@
 | 管理接口 | `mgmt0`，`192.168.80.135/24` |
 | 默认路由 | via `192.168.80.2`，dev `mgmt0` |
 | Underlay 接口 | `underlay0`，`192.168.232.11/24` |
-| network namespaces | 无 |
-| `cni-br0` / bridge ports | 无 |
-| `/opt/cni/bin/cloudnet` | 不存在，尚未安装 |
-| `/etc/cni/net.d` | 仅 `.cni-concurrency.lock`，尚无 cloudnet config |
+| network namespaces | 两次失败清理后的复核为无 |
+| `cni-br0` / bridge ports | `cni-br0` 保留，UP flag、MTU 1500、`10.77.0.1/24`；无 ports |
+| `/opt/cni/bin/cloudnet` | 用户已安装；修复后当前工作区 binary 更新，安装副本需再次 `sudo make install` |
+| `/etc/cni/net.d` | `10-cloudnet.conf` 已安装且与仓库配置一致 |
 | `/var/lib/cloudnet` | `root:root`、`0750`；内部因 sudo 密码不可读，不能判断旧状态 |
 | `/var/log/cloudnet` | `root:root`、`0750`；内部因 sudo 密码不可读 |
 | `net.ipv4.ip_forward` | `1` |
@@ -116,7 +116,7 @@ make -n integration clean-test
 
 - `install` 只有创建两个目标目录、安装 `build/cloudnet` 和安装 `configs/10-cloudnet.conf`；
 - Makefile 中没有隐式 sudo；
-- `integration` 先 build，再调用测试脚本；
+- `integration` 不以 root 编译；先检查 build 新鲜度及 installed binary/config 完全一致，再调用测试脚本；
 - `clean-test` 只调用项目 cleanup。
 
 ```bash
@@ -132,7 +132,9 @@ make verify
 | 非 root `make install` | exit 2，明确提示使用 `sudo make install`，未安装 |
 | 非 root `./hack/integration-v1.sh` | exit 1；trap 删除临时工作目录，未创建网络资源 |
 | 非 root `./hack/cleanup-v1.sh` | exit 1，未操作网络 |
-| `sudo make install` | sudo 认证失败 exit 1；make/install recipe 未执行 |
+| 初次 `sudo make install`（工具会话） | sudo 认证失败 exit 1；make/install recipe 未执行 |
+| 用户终端 `sudo make install` | PASS；binary 安装到 `/opt/cni/bin/cloudnet`，config 安装到 `/etc/cni/net.d/10-cloudnet.conf` |
+| 非 root `make integration`（修复后） | exit 2；在网络操作前明确拒绝旧 installed binary |
 
 `shellcheck` 与 `shfmt` 未安装，因此没有执行，也没有在本报告中标为通过。
 
@@ -148,14 +150,14 @@ cnitool gc     <net> <netns>
 cnitool status <net> <netns>
 ```
 
-这确认了 README 使用的参数形式。以下功能命令未执行：
+这确认了 README 使用的参数形式。integration 内部实际调用过 `cnitool add`，但在第一个 ADD 中途失败，未形成成功 Result。以下功能仍没有成功验收证据：
 
 - `cnitool add cloudnet-v1 <netns>`：PENDING；
 - `cnitool check cloudnet-v1 <netns>`：PENDING；
 - `cnitool del cloudnet-v1 <netns>`：PENDING；
 - 重复 ADD、重复 DEL、netns 先删除：PENDING。
 
-原因：`/opt/cni/bin/cloudnet` 和 `/etc/cni/net.d/10-cloudnet.conf` 尚未安装，安装需要 sudo 密码。
+原因：已定位并修复第一个 ADD 的 stale netlink alias snapshot 问题，但修复后的 binary 尚未重新安装和特权复跑。
 
 ## nerdctl 状态
 
@@ -177,14 +179,20 @@ cnitool status <net> <netns>
 
 ## 特权集成状态
 
-`hack/integration-v1.sh` 已实现并通过 bash parse/dry-run/非 root guard，但尚未以 root 执行。默认并发数为 6，可通过 `CLOUDNET_TEST_CONCURRENCY=2..16` 调整。资源使用 `cloudnet-test-*` namespace、`/tmp/cloudnet-test-*` 工作目录和精确 ownership cleanup；Bridge 按设计保留。
+`hack/integration-v1.sh` 已实现并通过 bash parse/dry-run/非 root guard。用户在 2026-08-08 实际执行了两次 `sudo make integration`。两次都进入 `A/B: ADD, idempotent ADD, bridge checks, and two-endpoint connectivity` 后 exit 1；旧版脚本随后清理临时目录，只留下通用 cleanup 消息，因此没有可引用的 cnitool stderr。第一次发生在安装前由旧 Makefile 以 root build 后，第二次发生在用户成功安装后。两次都属于 FAIL，不是 PENDING 或 PASS。
 
-以下矩阵不得解读为失败；它表示尚无实际特权证据：
+失败后的只读现场核验显示：`cni-br0` 存在且 admin UP、MTU 1500、地址 `10.77.0.1/24`；没有 bridge port、veth 或 network namespace；`mgmt0`/`underlay0` 仍 UP 且未加入 Bridge。空 Bridge 的 NO-CARRIER/operstate DOWN 属正常现象。普通用户无权读取 `/var/lib/cloudnet` 内部，因此不能声称 IPAM state 已清空或损坏。
+
+代码与上游 netlink v1.3.1 行为核对后确认根因：`LinkSetAlias` 只向内核发送更新，不会回填传入的 `LinkAttrs.Alias`。旧实现设置 alias 后立即验证旧快照，稳定得到 ownership mismatch，并由局部回滚删除 veth。修复后会重新 `LinkByName` 读取两端并验证，peer 移动后再次刷新 host 快照；新增单元测试覆盖陈旧快照和 lookup/mismatch 错误。
+
+脚本同时修复了隐藏证据和返回码问题：失败时打印 phase/命令/有限日志/state 与网络快照后再清理；`add_endpoint` 显式传播 cnitool exit code；成功 ADD 和 ping 都带具体失败标签。默认仍删除临时目录，只有显式设置 `CLOUDNET_KEEP_FAILURE_ARTIFACTS=1` 才保留。默认并发数为 6，可通过 `CLOUDNET_TEST_CONCURRENCY=2..16` 调整。
+
+下表区分已观察到的失败和修复后尚待取得的证据：
 
 | 验收项 | 状态 | 尚需取得的证据 |
 | --- | --- | --- |
-| 安装幂等 | PENDING | 两次 `sudo make install`、mode/hash/config 对照 |
-| 基础 ADD | PENDING | Bridge/address/UP、eth0/lo/default route、ping gateway |
+| 安装幂等 | PARTIAL | 一次 root 安装成功；第二次安装与修复后安装待执行 |
+| 基础 ADD | FAIL / PENDING RETEST | 两次旧 binary 均在首个 ADD 中途失败；alias snapshot 已修，待 root 复测 |
 | 两 endpoint | PENDING | IP 不重复、双向 ping、host ping |
 | 正常 CHECK | PENDING | cnitool/integration exit 0 |
 | 接口 DOWN CHECK | PENDING | 注入后具体失败、恢复后成功 |
@@ -201,7 +209,7 @@ cnitool status <net> <netns>
 
 集成脚本在调用前还会用 `cmp` 确认已安装 `/opt/cni/bin/cloudnet` 与当前 `build/cloudnet` 相同，避免测试旧 binary。
 
-最终只读复核仍只看到 `lo`、`mgmt0` 和 `underlay0`，`ip netns list` 为空，`cni-br0` 不存在；非特权验证没有在宿主机遗留网络对象。
+最终只读复核看到 `lo`、`mgmt0`、`underlay0` 和按设计保留的空 `cni-br0`；`ip netns list` 为空，Bridge 没有 ports。未发现 veth/netns 残留，但 state 内容因权限不可读，不能作无残留结论。
 
 ## 完成标准对照
 
@@ -211,7 +219,7 @@ cnitool status <net> <netns>
 | `go test -race ./...` | PASS |
 | `go vet ./...` | PASS |
 | build / VERSION | PASS |
-| CNI ADD/CHECK/DEL | PENDING ROOT |
+| CNI ADD/CHECK/DEL | ADD FAIL（旧 binary）；修复后 PENDING ROOT RETEST |
 | 重复 ADD/DEL | PENDING ROOT |
 | 两 namespace 通信 | PENDING ROOT |
 | 两 nerdctl 容器通信 | PENDING ROOT |
@@ -221,18 +229,17 @@ cnitool status <net> <netns>
 | 并发 IP 无重复 | PASS UNIT；PENDING ROOT INTEGRATION |
 | stdout 无日志污染 | PASS ERROR PATH；PENDING SUCCESS ADD PATH |
 | JSON 诊断字段 | PASS UNIT/ERROR PATH |
-| 安装脚本可重复运行 | PASS DRY-RUN/GUARD；PENDING ROOT INSTALL |
-| cleanup 不误删无关网络 | PASS CODE/GUARD REVIEW；PENDING ROOT EXECUTION |
+| 安装脚本可重复运行 | PASS DRY-RUN/GUARD；一次 ROOT INSTALL PASS；幂等复装待测 |
+| cleanup 不误删无关网络 | PASS CODE/GUARD REVIEW；失败路径实际保留 Bridge 且未动 mgmt/underlay，完整矩阵待测 |
 | 文档 | PRESENT；需在特权验收后更新本报告 |
 | OVS/VXLAN/Agent/Prometheus 未进入范围 | PASS CODE REVIEW |
 
 ## root 验收后的更新要求
 
-获得 sudo 后，应按顺序执行并把真实时间、exit code、关键输出和清理后状态追加到本报告：
+修复后的 build 已生成。下一次 root 验收应按顺序执行并把真实时间、exit code、关键输出和清理后状态追加到本报告：
 
 ```bash
 cd /home/cloudnet-template/src/cloudnet
-sudo make install
 sudo make install
 sudo make integration
 ```

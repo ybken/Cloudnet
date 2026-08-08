@@ -66,6 +66,7 @@ V1 的固定契约为：
 
 - **network namespace** 隔离链接、地址和路由表；`ns.GetNS`/`NetNS.Do` 保证 netlink 调用发生在目标 namespace。
 - **veth** 是成对的虚拟以太设备，一端收到的 frame 从另一端出现。删除任一端会删除 pair。
+- **ownership snapshot**：netlink 的 setter 成功不表示调用方持有的 `Link` 快照已更新。设置两端 alias 后必须按名称重新读取内核对象，再做完整 alias 校验；peer 移入 namespace 后也重新读取 host 端，避免用陈旧快照做后续破坏性操作或回滚。
 - **Linux Bridge** 在同一二层广播域内学习 MAC/FDB 并转发 frame。管理/Underlay 物理接口从不作为 slave；插件只把自己刚创建且校验过 alias 的 host veth 加入 Bridge。
 - **地址和路由**：endpoint 与 gateway 同属 `/24`，邻居发现直接到 Bridge；容器间流量由 Bridge 交换。到 `10.77.0.1` 的流量进入 host stack。外部目的匹配默认路由，但 V1 不提供 host forwarding/SNAT。
 - **MTU**：Bridge、host veth、container veth 都必须为 1500；CHECK 会检测漂移。

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 readonly SCRIPT_DIR
@@ -16,6 +16,9 @@ readonly RUN_ID
 WORK_DIR=$(mktemp -d "/tmp/cloudnet-test-${RUN_ID}.XXXXXX")
 readonly WORK_DIR
 readonly CONCURRENCY="${CLOUDNET_TEST_CONCURRENCY:-6}"
+readonly KEEP_FAILURE_ARTIFACTS="${CLOUDNET_KEEP_FAILURE_ARTIFACTS:-0}"
+
+CURRENT_PHASE='startup'
 
 declare -a namespaces=()
 declare -a background_pids=()
@@ -94,14 +97,15 @@ add_endpoint() {
   local output_file=$2
   local error_file=$3
   local if_name=${4:-eth0}
-  local netns_path
+  local netns_path rc=0
 
   netns_path=$(namespace_path "${namespace}")
+  namespace_ifnames["${namespace}"]="${if_name}"
   CNI_PATH="${CNI_PATH_VALUE}" \
     NETCONFPATH="${NETCONF_PATH}" \
     CNI_IFNAME="${if_name}" \
-    cnitool add "${NETWORK_NAME}" "${netns_path}" >"${output_file}" 2>"${error_file}"
-  namespace_ifnames["${namespace}"]="${if_name}"
+    cnitool add "${NETWORK_NAME}" "${netns_path}" >"${output_file}" 2>"${error_file}" || rc=$?
+  return "${rc}"
 }
 
 check_endpoint() {
@@ -140,15 +144,96 @@ remove_owned_host_veth() {
   ip link delete dev "${host_veth}" || true
 }
 
+print_artifact() {
+  local path=$1
+
+  [[ -f ${path} ]] || return 0
+  printf '[integration-v1] --- %s ---\n' "${path}" >&2
+  sed -n '1,160p' "${path}" >&2
+}
+
+dump_failure_evidence() {
+  local path
+
+  printf '[integration-v1] failure evidence: phase=%s workDir=%s\n' \
+    "${CURRENT_PHASE}" "${WORK_DIR}" >&2
+  for path in \
+    "${WORK_DIR}"/*.err \
+    "${WORK_DIR}"/*.log \
+    "${WORK_DIR}"/*.out \
+    "${WORK_DIR}"/*.json; do
+    [[ -e ${path} ]] || continue
+    print_artifact "${path}"
+  done
+
+  if [[ -e ${STATE_FILE} ]]; then
+    printf '[integration-v1] --- cloudnet test state summary ---\n' >&2
+    jq '{
+      version,
+      networkName,
+      endpointCount: (.endpoints | length),
+      allocationCount: (.allocations | length),
+      testEndpoints: [
+        .endpoints[]
+        | select((.netns // "") | test("^/(var/)?run/netns/cloudnet-test-"))
+      ]
+    }' "${STATE_FILE}" >&2 || true
+  fi
+
+  printf '[integration-v1] --- network snapshot before cleanup ---\n' >&2
+  ip -br link >&2 || true
+  ip -br -4 addr >&2 || true
+  ip netns list >&2 || true
+  bridge link >&2 || true
+  ip -d link show master "${BRIDGE_NAME}" >&2 || true
+}
+
+on_error() {
+  local status=$1
+  local line=$2
+  local command=$3
+
+  printf '[integration-v1] ERROR: phase=%s exit=%d line=%s command=%q\n' \
+    "${CURRENT_PHASE}" "${status}" "${line}" "${command}" >&2
+}
+
+run_checked() {
+  local label=$1
+  local output_file=$2
+  shift 2
+
+  if ! "$@" >"${output_file}" 2>&1; then
+    print_artifact "${output_file}"
+    fail "${label}"
+  fi
+}
+
+add_endpoint_or_fail() {
+  local namespace=$1
+  local output_file=$2
+  local error_file=$3
+  local label=$4
+  local if_name=${5:-eth0}
+
+  if ! add_endpoint "${namespace}" "${output_file}" "${error_file}" "${if_name}"; then
+    print_artifact "${error_file}"
+    print_artifact "${output_file}"
+    fail "${label}; CNI artifacts are included in the failure evidence"
+  fi
+}
+
 cleanup() {
   local status=$?
   local namespace pid
 
-  trap - EXIT INT TERM
+  trap - ERR EXIT INT TERM
   set +e
   for pid in "${background_pids[@]}"; do
     wait "${pid}" >/dev/null 2>&1
   done
+  if (( status != 0 )); then
+    dump_failure_evidence
+  fi
   for namespace in "${namespaces[@]}"; do
     is_test_namespace "${namespace}" || continue
     delete_endpoint "${namespace}" >/dev/null 2>&1
@@ -157,7 +242,11 @@ cleanup() {
       ip netns delete "${namespace}"
     fi
   done
-  rm -rf -- "${WORK_DIR}"
+  if (( status == 0 )) || [[ ${KEEP_FAILURE_ARTIFACTS} != 1 ]]; then
+    rm -rf -- "${WORK_DIR}"
+  else
+    printf '[integration-v1] retained failure artifacts: %s\n' "${WORK_DIR}" >&2
+  fi
   set -e
   if (( status != 0 )); then
     printf '[integration-v1] cleanup ran after failure (exit %d); cni-br0 was retained.\n' "${status}" >&2
@@ -165,7 +254,10 @@ cleanup() {
   exit "${status}"
 }
 
-trap cleanup EXIT INT TERM
+trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 assert_result_json() {
   local path=$1
@@ -249,9 +341,9 @@ assert_endpoint() {
   expected_alias=$(derived_alias "$(namespace_path "${namespace}")" "${if_name}")
   [[ $(<"/sys/class/net/${host_veth}/ifalias") == "${expected_alias}" ]] \
     || fail "${host_veth} ownership alias does not match"
-  ip -j -4 addr show dev "${host_veth}" \
-    | jq -e 'length == 1 and (.[0].addr_info | length == 0)' >/dev/null \
-    || fail "${host_veth} unexpectedly has an IPv4 address"
+  ip -j addr show dev "${host_veth}" \
+  | jq -e '[.[].addr_info[]? | select(.family == "inet")] | length == 0' >/dev/null \
+  || fail "${host_veth} unexpectedly has an IPv4 address"
 }
 
 assert_state_ip_absent() {
@@ -305,7 +397,7 @@ if (( EUID != 0 )); then
   fail 'integration-v1.sh requires root; run sudo make integration'
 fi
 
-for command_name in ip bridge ping cnitool jq sha256sum sha512sum awk grep sort uniq mktemp wc cmp; do
+for command_name in ip bridge ping cnitool jq sha256sum sha512sum awk grep sed sort uniq mktemp wc cmp; do
   require_command "${command_name}"
 done
 
@@ -330,25 +422,38 @@ jq -e '
 (( CONCURRENCY >= 2 && CONCURRENCY <= 16 )) \
   || fail 'CLOUDNET_TEST_CONCURRENCY must be between 2 and 16'
 
+CURRENT_PHASE='A/B ADD and connectivity'
 log 'A/B: ADD, idempotent ADD, bridge checks, and two-endpoint connectivity'
 ns_a="cloudnet-test-a-${RUN_ID}"
 ns_b="cloudnet-test-b-${RUN_ID}"
 create_namespace "${ns_a}"
 create_namespace "${ns_b}"
 
-add_endpoint "${ns_a}" "${WORK_DIR}/a-add.json" "${WORK_DIR}/a-add.log"
+add_endpoint_or_fail \
+  "${ns_a}" \
+  "${WORK_DIR}/a-add.json" \
+  "${WORK_DIR}/a-add.log" \
+  'first endpoint ADD failed'
 assert_result_json "${WORK_DIR}/a-add.json"
 assert_json_logs "${WORK_DIR}/a-add.log"
 ip_a=$(result_ip "${WORK_DIR}/a-add.json")
 host_a=$(result_host_veth "${WORK_DIR}/a-add.json")
 namespace_hosts["${ns_a}"]="${host_a}"
 
-add_endpoint "${ns_a}" "${WORK_DIR}/a-add-again.json" "${WORK_DIR}/a-add-again.log"
+add_endpoint_or_fail \
+  "${ns_a}" \
+  "${WORK_DIR}/a-add-again.json" \
+  "${WORK_DIR}/a-add-again.log" \
+  'idempotent endpoint ADD failed'
 assert_result_json "${WORK_DIR}/a-add-again.json"
 [[ $(result_ip "${WORK_DIR}/a-add-again.json") == "${ip_a}" ]] \
   || fail 'repeated ADD returned a different address'
 
-add_endpoint "${ns_b}" "${WORK_DIR}/b-add.json" "${WORK_DIR}/b-add.log"
+add_endpoint_or_fail \
+  "${ns_b}" \
+  "${WORK_DIR}/b-add.json" \
+  "${WORK_DIR}/b-add.log" \
+  'second endpoint ADD failed'
 assert_result_json "${WORK_DIR}/b-add.json"
 ip_b=$(result_ip "${WORK_DIR}/b-add.json")
 host_b=$(result_host_veth "${WORK_DIR}/b-add.json")
@@ -358,30 +463,60 @@ namespace_hosts["${ns_b}"]="${host_b}"
 assert_bridge
 assert_endpoint "${ns_a}" "${ip_a}" "${host_a}"
 assert_endpoint "${ns_b}" "${ip_b}" "${host_b}"
-ip netns exec "${ns_a}" ping -c 2 -W 2 "${GATEWAY}" >/dev/null
-ip netns exec "${ns_a}" ping -c 2 -W 2 "${ip_b}" >/dev/null
-ip netns exec "${ns_b}" ping -c 2 -W 2 "${ip_a}" >/dev/null
-ping -c 2 -W 2 "${ip_a}" >/dev/null
-ping -c 2 -W 2 "${ip_b}" >/dev/null
+run_checked \
+  "${ns_a} could not ping gateway ${GATEWAY}" \
+  "${WORK_DIR}/ping-a-gateway.out" \
+  ip netns exec "${ns_a}" ping -c 2 -W 2 "${GATEWAY}"
+run_checked \
+  "${ns_a} could not ping ${ns_b} at ${ip_b}" \
+  "${WORK_DIR}/ping-a-b.out" \
+  ip netns exec "${ns_a}" ping -c 2 -W 2 "${ip_b}"
+run_checked \
+  "${ns_b} could not ping ${ns_a} at ${ip_a}" \
+  "${WORK_DIR}/ping-b-a.out" \
+  ip netns exec "${ns_b}" ping -c 2 -W 2 "${ip_a}"
+run_checked \
+  "host could not ping ${ns_a} at ${ip_a}" \
+  "${WORK_DIR}/ping-host-a.out" \
+  ping -c 2 -W 2 "${ip_a}"
+run_checked \
+  "host could not ping ${ns_b} at ${ip_b}" \
+  "${WORK_DIR}/ping-host-b.out" \
+  ping -c 2 -W 2 "${ip_b}"
 
+CURRENT_PHASE='C CHECK drift detection'
 log 'C: CHECK success and diagnosed topology drift'
+
+# Baseline: healthy endpoint must pass CHECK.
 check_endpoint "${ns_a}" >/dev/null
+
+# Drift 1: container interface down.
 ip -n "${ns_a}" link set dev eth0 down
 expect_check_failure "${ns_a}" 'container-link-down'
-ip -n "${ns_a}" link set dev eth0 up
-check_endpoint "${ns_a}" >/dev/null
 
-ip -n "${ns_a}" route delete default
-expect_check_failure "${ns_a}" 'default-route-missing'
+# Restore the complete expected state.
+ip -n "${ns_a}" link set dev eth0 up
 ip -n "${ns_a}" route replace default via "${GATEWAY}" dev eth0
 check_endpoint "${ns_a}" >/dev/null
 
+# Drift 2: default route missing.
+ip -n "${ns_a}" route delete default
+expect_check_failure "${ns_a}" 'default-route-missing'
+
+# Restore default route.
+ip -n "${ns_a}" route replace default via "${GATEWAY}" dev eth0
+check_endpoint "${ns_a}" >/dev/null
+
+# Drift 3: host veth detached from bridge.
 ip link set dev "${host_a}" nomaster
 expect_check_failure "${ns_a}" 'host-veth-detached'
+
+# Restore host veth.
 ip link set dev "${host_a}" master "${BRIDGE_NAME}"
 ip link set dev "${host_a}" up
 check_endpoint "${ns_a}" >/dev/null
 
+CURRENT_PHASE='D DEL idempotency'
 log 'D: normal and repeated DEL while another endpoint remains healthy'
 delete_endpoint "${ns_a}"
 ip link show dev "${host_a}" >/dev/null 2>&1 && fail "${host_a} remains after DEL"
@@ -391,12 +526,20 @@ delete_endpoint "${ns_a}"
 assert_endpoint_state_absent "${ns_a}"
 [[ -d /sys/class/net/${BRIDGE_NAME}/bridge ]] || fail 'shared bridge was deleted by DEL'
 check_endpoint "${ns_b}" >/dev/null
-ip netns exec "${ns_b}" ping -c 2 -W 2 "${GATEWAY}" >/dev/null
+run_checked \
+  "remaining endpoint ${ns_b} could not ping gateway after peer DEL" \
+  "${WORK_DIR}/ping-b-after-a-del.out" \
+  ip netns exec "${ns_b}" ping -c 2 -W 2 "${GATEWAY}"
 
+CURRENT_PHASE='D address reuse'
 log 'D: released lowest address is reusable'
 ns_reuse="cloudnet-test-reuse-${RUN_ID}"
 create_namespace "${ns_reuse}"
-add_endpoint "${ns_reuse}" "${WORK_DIR}/reuse-add.json" "${WORK_DIR}/reuse-add.log"
+add_endpoint_or_fail \
+  "${ns_reuse}" \
+  "${WORK_DIR}/reuse-add.json" \
+  "${WORK_DIR}/reuse-add.log" \
+  'address-reuse endpoint ADD failed'
 ip_reuse=$(result_ip "${WORK_DIR}/reuse-add.json")
 host_reuse=$(result_host_veth "${WORK_DIR}/reuse-add.json")
 namespace_hosts["${ns_reuse}"]="${host_reuse}"
@@ -405,10 +548,15 @@ delete_endpoint "${ns_reuse}"
 assert_state_ip_absent "${ip_reuse}"
 assert_endpoint_state_absent "${ns_reuse}"
 
+CURRENT_PHASE='E missing netns DEL'
 log 'E: namespace removal before DEL'
 ns_gone="cloudnet-test-gone-${RUN_ID}"
 create_namespace "${ns_gone}"
-add_endpoint "${ns_gone}" "${WORK_DIR}/gone-add.json" "${WORK_DIR}/gone-add.log"
+add_endpoint_or_fail \
+  "${ns_gone}" \
+  "${WORK_DIR}/gone-add.json" \
+  "${WORK_DIR}/gone-add.log" \
+  'missing-netns scenario ADD failed'
 ip_gone=$(result_ip "${WORK_DIR}/gone-add.json")
 host_gone=$(result_host_veth "${WORK_DIR}/gone-add.json")
 namespace_hosts["${ns_gone}"]="${host_gone}"
@@ -418,10 +566,15 @@ ip link show dev "${host_gone}" >/dev/null 2>&1 && fail "${host_gone} remains af
 assert_state_ip_absent "${ip_gone}"
 assert_endpoint_state_absent "${ns_gone}"
 
+CURRENT_PHASE='E empty CNI_NETNS DEL'
 log 'E: DEL accepts an empty CNI_NETNS and remains idempotent without state'
 ns_empty="cloudnet-test-empty-${RUN_ID}"
 create_namespace "${ns_empty}"
-add_endpoint "${ns_empty}" "${WORK_DIR}/empty-add.json" "${WORK_DIR}/empty-add.log"
+add_endpoint_or_fail \
+  "${ns_empty}" \
+  "${WORK_DIR}/empty-add.json" \
+  "${WORK_DIR}/empty-add.log" \
+  'empty-CNI_NETNS scenario ADD failed'
 ip_empty=$(result_ip "${WORK_DIR}/empty-add.json")
 host_empty=$(result_host_veth "${WORK_DIR}/empty-add.json")
 namespace_hosts["${ns_empty}"]="${host_empty}"
@@ -443,6 +596,7 @@ assert_state_ip_absent "${ip_empty}"
 assert_endpoint_state_absent "${ns_empty}"
 delete_endpoint "${ns_empty}"
 
+CURRENT_PHASE='F ADD rollback injection'
 log 'F: mid-ADD interface conflict rolls back allocation and veth'
 ns_fail="cloudnet-test-fail-${RUN_ID}"
 create_namespace "${ns_fail}"
@@ -461,6 +615,7 @@ ip link show dev "${fail_host}" >/dev/null 2>&1 && fail 'failed ADD leaked a hos
 ip -n "${ns_fail}" -d link show dev eth0 | grep -qw dummy \
   || fail 'failed ADD damaged the pre-existing dummy interface'
 
+CURRENT_PHASE='G concurrent ADD and DEL'
 log "G: ${CONCURRENCY} concurrent ADD operations receive unique addresses"
 declare -a concurrent_namespaces=()
 declare -a add_pids=()
@@ -506,10 +661,10 @@ for pid in "${del_pids[@]}"; do
 done
 
 for namespace in "${concurrent_namespaces[@]}"; do
-	host_veth=${namespace_hosts["${namespace}"]}
-	ip link show dev "${host_veth}" >/dev/null 2>&1 \
-		&& fail "${host_veth} remains after concurrent DEL"
-	assert_endpoint_state_absent "${namespace}"
+  host_veth=${namespace_hosts["${namespace}"]}
+  ip link show dev "${host_veth}" >/dev/null 2>&1 \
+    && fail "${host_veth} remains after concurrent DEL"
+  assert_endpoint_state_absent "${namespace}"
 done
 while read -r ip_address; do
   assert_state_ip_absent "${ip_address}"
@@ -520,4 +675,5 @@ assert_state_ip_absent "${ip_b}"
 assert_endpoint_state_absent "${ns_b}"
 assert_bridge
 
+CURRENT_PHASE='complete'
 log 'PASS: ADD/CHECK/DEL, rollback, missing-netns cleanup, and concurrency all succeeded'

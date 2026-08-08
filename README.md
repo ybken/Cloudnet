@@ -147,6 +147,8 @@ sudo make install
 
 `make install` 只把 `build/cloudnet` 安装为 `/opt/cni/bin/cloudnet`，并把 `configs/10-cloudnet.conf` 安装为 `/etc/cni/net.d/10-cloudnet.conf`。Makefile 不隐式调用 sudo。也可以显式运行：
 
+`sudo make install` 不编译 Go 代码，也不下载 module；它只安装已经由普通用户构建且通过新鲜度检查的产物。`sudo make integration` 在创建 namespace 前还会逐字节核对工作区 binary/config 与已安装文件，发现旧安装会直接拒绝执行。
+
 ```bash
 sudo ./hack/install-v1.sh
 ```
@@ -249,6 +251,8 @@ sudo make clean-test
 ```
 
 集成测试覆盖的故障包括容器接口 DOWN、默认路由缺失、host veth 脱离 Bridge、目标接口冲突、缺失 netns 和并发 endpoint。每次故障后都应验证具体 CHECK 错误，并检查没有残留 veth、错误占用 IP 或受影响的其他 endpoint。
+
+失败时脚本会先把当前 phase、失败命令、有限长度的 CNI 输出、state 摘要和网络快照写到 stderr，再清理本次测试资源。临时目录默认仍会删除；需要保留完整文件调查时可显式运行 `sudo env CLOUDNET_KEEP_FAILURE_ARTIFACTS=1 make integration`。
 
 手工注入只允许作用于 `cloudnet-test-` namespace 或能由 alias 精确证明归属的 veth。例如可把测试 namespace 的 `eth0` 置 DOWN 后运行 CHECK，再恢复 UP；可删除测试 namespace 的默认路由后运行 CHECK，再按 `via 10.77.0.1 dev eth0` 恢复。不要在有 endpoint 时替换 `cni-br0`，不要创建同名非 Bridge 对象覆盖现有接口。
 
