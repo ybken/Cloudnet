@@ -1,0 +1,5 @@
+/build/
+*.test
+*.out
+coverage.html
+coverage.out
