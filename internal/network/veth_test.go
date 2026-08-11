@@ -1,3 +1,5 @@
+// 本文件验证 netlink setter 后必须刷新内核快照，并拒绝无法证明 alias 的 veth。
+// 测试名描述场景，子测试分别表达输入变化与期望结果。
 package network
 
 import (

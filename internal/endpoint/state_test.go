@@ -1,3 +1,5 @@
+// 本文件验证 endpoint key 的稳定无歧义摘要以及记录身份字段校验。
+// 测试名描述场景，子测试分别表达输入变化与期望结果。
 package endpoint_test
 
 import (

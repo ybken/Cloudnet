@@ -1,3 +1,5 @@
+// 本文件验证内部 ResultData 到 CNI current Result 的接口索引、地址、网关、路由和版本兼容。
+// 测试名描述场景，子测试分别表达输入变化与期望结果。
 package cni
 
 import (

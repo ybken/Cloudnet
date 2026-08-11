@@ -9,13 +9,14 @@ import (
 	"github.com/containernetworking/cni/pkg/version"
 )
 
-// ValidatePrevResult verifies the cached ADD result used by CNI CHECK against
-// the endpoint state that was just observed from Linux.
+// ValidatePrevResult 将 runtime 缓存的 ADD 结果与刚从 Linux 状态生成的 expected
+// 对照。prevResult 可选；缺失时 CHECK 仍会验证持久状态和内核。
 func ValidatePrevResult(raw map[string]interface{}, cniVersion string, expected ResultData) error {
 	if raw == nil {
 		return nil
 	}
 
+	// ParsePrevResult 可能改写 RawPrevResult，先浅拷贝顶层 map 避免改变配置对象。
 	pluginConf := &cnitypes.PluginConf{
 		CNIVersion:    cniVersion,
 		RawPrevResult: cloneMap(raw),
@@ -23,11 +24,13 @@ func ValidatePrevResult(raw map[string]interface{}, cniVersion string, expected 
 	if err := version.ParsePrevResult(pluginConf); err != nil {
 		return fmt.Errorf("parse prevResult: %w", err)
 	}
+	// 各 CNI 版本先规范化为 types/100，后续只维护一套比较逻辑。
 	result, err := current.NewResultFromResult(pluginConf.PrevResult)
 	if err != nil {
 		return fmt.Errorf("normalize prevResult: %w", err)
 	}
 
+	// 以 (name, sandbox) 唯一定位；只按 eth0 名称会误匹配其他 namespace。
 	containerIndex, err := findInterface(result.Interfaces, expected.IfName, expected.NetNS)
 	if err != nil {
 		return fmt.Errorf("prevResult container interface: %w", err)
@@ -64,9 +67,8 @@ func ValidatePrevResult(raw map[string]interface{}, cniVersion string, expected 
 		}
 		containerIPv4s = append(containerIPv4s, candidate)
 	}
-	// A chained result can contain addresses owned by other plugins. Cloudnet
-	// validates only IPv4 configurations explicitly bound to its container
-	// interface; entries for other interfaces and IPv6 entries are outside V1.
+	// 链式 Result 可含其他插件的地址。这里只检查绑定到本容器接口的 IPv4；
+	// 其他接口和 IPv6 不属于 cloudnet V1 的责任范围。
 	if len(containerIPv4s) != 1 {
 		return fmt.Errorf("prevResult container IPv4 address count is %d, want 1", len(containerIPv4s))
 	}
@@ -78,6 +80,7 @@ func ValidatePrevResult(raw map[string]interface{}, cniVersion string, expected 
 		return fmt.Errorf("prevResult gateway is %s, want %s", containerIPv4.Gateway, expected.Gateway)
 	}
 
+	// route 没有 Interface 索引可核对，故要求整个 Result 恰好一个 IPv4 default。
 	defaultRoutes := 0
 	for _, route := range result.Routes {
 		if route == nil || !isIPv4Default(route.Dst) {
@@ -94,6 +97,7 @@ func ValidatePrevResult(raw map[string]interface{}, cniVersion string, expected 
 	return nil
 }
 
+// cloneMap 复制顶层容器；本函数不会直接改写嵌套值。
 func cloneMap(input map[string]interface{}) map[string]interface{} {
 	result := make(map[string]interface{}, len(input))
 	for key, value := range input {
@@ -102,6 +106,7 @@ func cloneMap(input map[string]interface{}) map[string]interface{} {
 	return result
 }
 
+// findInterface 要求唯一匹配；重复项也代表 prevResult 自相矛盾。
 func findInterface(interfaces []*current.Interface, name, sandbox string) (int, error) {
 	found := -1
 	for index, candidate := range interfaces {
@@ -119,6 +124,7 @@ func findInterface(interfaces []*current.Interface, name, sandbox string) (int, 
 	return found, nil
 }
 
+// verifyInterface 只检查 expected 中存在的观测值；空 MAC/非正 MTU 表示未知。
 func verifyInterface(actual *current.Interface, expectedMAC string, expectedMTU int) error {
 	if expectedMAC != "" && actual.Mac != expectedMAC {
 		return fmt.Errorf("MAC is %q, want %q", actual.Mac, expectedMAC)
@@ -129,6 +135,7 @@ func verifyInterface(actual *current.Interface, expectedMAC string, expectedMTU 
 	return nil
 }
 
+// isIPv4Default 接受 nil/未指定地址，但必须是 32 位地址族的 /0。
 func isIPv4Default(dst net.IPNet) bool {
 	ones, bits := dst.Mask.Size()
 	return bits == 32 && ones == 0 && (dst.IP == nil || dst.IP.IsUnspecified())

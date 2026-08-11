@@ -1,3 +1,5 @@
+// 本文件验证确定性 veth 名称的长度/稳定性、tuple 边界隔离和完整 alias 所有权。
+// 测试名描述场景，子测试分别表达输入变化与期望结果。
 package network
 
 import (

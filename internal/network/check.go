@@ -8,6 +8,9 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// CheckEndpoint 只读验证 veth 两端、容器地址、loopback 与默认路由。
+// 共享 Bridge 自身由调用方另行调用 CheckBridge 验证。
+//
 // CheckEndpoint verifies both ends of a veth pair and the default route.
 // Call CheckBridge separately to verify the shared bridge address and MTU.
 func CheckEndpoint(spec EndpointSpec) error {
@@ -18,6 +21,7 @@ func CheckEndpoint(spec EndpointSpec) error {
 	if err != nil {
 		return err
 	}
+	// 先查 host 端；它缺失时无需再进入 netns，报错也更接近根因。
 	if err := checkHostEndpoint(spec, bridge); err != nil {
 		return err
 	}
@@ -26,6 +30,7 @@ func CheckEndpoint(spec EndpointSpec) error {
 		return err
 	}
 	defer netNS.Close()
+	// 下列 netlink 查询必须在目标 namespace 的线程上下文中执行。
 	if err := netNS.Do(func(_ cnins.NetNS) error {
 		containerLink, found, err := linkByName(spec.IfName)
 		if err != nil {
@@ -48,6 +53,7 @@ func CheckEndpoint(spec EndpointSpec) error {
 		if containerLink.Attrs().Flags&net.FlagUp == 0 {
 			return fmt.Errorf("check mismatch: container interface %q is down", spec.IfName)
 		}
+		// 地址、lo 和路由均只核验，不调用 setter 修复。
 		addresses, err := netlink.AddrList(containerLink, netlink.FAMILY_V4)
 		if err != nil {
 			return fmt.Errorf("check container interface %q addresses: %w", spec.IfName, err)
@@ -84,6 +90,8 @@ func CheckEndpoint(spec EndpointSpec) error {
 	return nil
 }
 
+// checkHostEndpoint 验证 host veth 的类型/alias、MTU、UP、Bridge master，
+// 并确保三层 IPv4 只配置在共享 Bridge，而不落在端口上。
 func checkHostEndpoint(spec EndpointSpec, bridge *netlink.Bridge) error {
 	host, found, err := linkByName(spec.HostVethName)
 	if err != nil {

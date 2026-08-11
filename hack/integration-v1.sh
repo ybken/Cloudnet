@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
+# -E 让函数继承 ERR trap；其余严格模式避免测试悄然漏检失败。
 set -Eeuo pipefail
 
+# 使用脚本位置而非调用目录定位构建产物与配置。
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 readonly SCRIPT_DIR
 PROJECT_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd -P)
@@ -11,15 +13,19 @@ readonly GATEWAY='10.77.0.1'
 readonly CNI_PATH_VALUE='/opt/cni/bin'
 readonly NETCONF_PATH='/etc/cni/net.d'
 readonly STATE_FILE='/var/lib/cloudnet/networks/cloudnet-v1/state.json'
+# UTC 时间与 PID 组成运行 ID，避免并行/残留测试对象重名。
 RUN_ID="$(date -u +%Y%m%d%H%M%S)-$$"
 readonly RUN_ID
+# stdout、stderr 与诊断证据隔离在本次运行的专属临时目录。
 WORK_DIR=$(mktemp -d "/tmp/cloudnet-test-${RUN_ID}.XXXXXX")
 readonly WORK_DIR
 readonly CONCURRENCY="${CLOUDNET_TEST_CONCURRENCY:-6}"
 readonly KEEP_FAILURE_ARTIFACTS="${CLOUDNET_KEEP_FAILURE_ARTIFACTS:-0}"
 
+# ERR/EXIT trap 会输出当前阶段，直接指出失败属于哪项验收。
 CURRENT_PHASE='startup'
 
+# 记录本次创建的 namespace、后台进程和 veth，供 EXIT trap 精确清理。
 declare -a namespaces=()
 declare -a background_pids=()
 declare -A namespace_ifnames=()
@@ -34,14 +40,17 @@ fail() {
   exit 1
 }
 
+# 在创建内核对象前完成外部命令依赖预检。
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "required command is missing: $1"
 }
 
+# 所有可能删除的 namespace 必须通过白名单语法。
 is_test_namespace() {
   [[ $1 =~ ^cloudnet-test-[a-z0-9][a-z0-9_.-]*$ ]]
 }
 
+# 复刻 cnitool 从 netns 路径派生 containerID 的规则。
 cnitool_container_id() {
   local netns_path=$1
   local digest
@@ -50,6 +59,7 @@ cnitool_container_id() {
   printf 'cnitool-%s\n' "${digest:0:20}"
 }
 
+# 与 Go 端相同：NUL 分隔身份 tuple 后计算 SHA-256。
 endpoint_digest() {
   local container_id=$1
   local if_name=$2
@@ -59,6 +69,7 @@ endpoint_digest() {
     | awk '{print $1}'
 }
 
+# 推导 cn + 13 hex 的确定性 host veth 名。
 derived_host_veth() {
   local netns_path=$1
   local if_name=$2
@@ -69,6 +80,7 @@ derived_host_veth() {
   printf 'cn%s\n' "${digest:0:13}"
 }
 
+# alias 保留完整 digest，是清理和归属断言的授权依据。
 derived_alias() {
   local netns_path=$1
   local if_name=$2
@@ -83,6 +95,7 @@ namespace_path() {
   printf '/run/netns/%s\n' "$1"
 }
 
+# 只接受测试前缀，并立即登记到 EXIT 清理集合。
 create_namespace() {
   local namespace=$1
 
@@ -92,6 +105,7 @@ create_namespace() {
   namespace_ifnames["${namespace}"]='eth0'
 }
 
+# stdout Result 与 stderr JSON 日志分文件保存，以验证协议通道隔离。
 add_endpoint() {
   local namespace=$1
   local output_file=$2
@@ -108,6 +122,7 @@ add_endpoint() {
   return "${rc}"
 }
 
+# CHECK 成功不输出 Result；调用方按场景捕获诊断。
 check_endpoint() {
   local namespace=$1
   local if_name=${namespace_ifnames["${namespace}"]:-eth0}
@@ -118,6 +133,7 @@ check_endpoint() {
     cnitool check "${NETWORK_NAME}" "$(namespace_path "${namespace}")"
 }
 
+# 正常清理走真实 CNI DEL，覆盖与 runtime 相同的调用路径。
 delete_endpoint() {
   local namespace=$1
   local if_name=${namespace_ifnames["${namespace}"]:-eth0}
@@ -128,6 +144,7 @@ delete_endpoint() {
     cnitool del "${NETWORK_NAME}" "$(namespace_path "${namespace}")" >/dev/null
 }
 
+# trap 兜底也要求名称、类型和完整 alias，不宽泛删除 veth。
 remove_owned_host_veth() {
   local namespace=$1
   local if_name=${namespace_ifnames["${namespace}"]:-eth0}
@@ -152,6 +169,7 @@ print_artifact() {
   sed -n '1,160p' "${path}" >&2
 }
 
+# 清理前收集有限日志、测试 state 摘要和网络快照，便于复盘。
 dump_failure_evidence() {
   local path
 
@@ -188,6 +206,7 @@ dump_failure_evidence() {
   ip -d link show master "${BRIDGE_NAME}" >&2 || true
 }
 
+# ERR trap 记录退出码、行号和命令；资源统一由 EXIT trap 清理。
 on_error() {
   local status=$1
   local line=$2
@@ -197,6 +216,7 @@ on_error() {
     "${CURRENT_PHASE}" "${status}" "${line}" "${command}" >&2
 }
 
+# 保存外部命令输出，失败时先打印 artifact 再终止。
 run_checked() {
   local label=$1
   local output_file=$2
@@ -208,6 +228,7 @@ run_checked() {
   fi
 }
 
+# ADD 包装会同时展示 stdout/stderr，区分协议错误和诊断日志。
 add_endpoint_or_fail() {
   local namespace=$1
   local output_file=$2
@@ -222,10 +243,13 @@ add_endpoint_or_fail() {
   fi
 }
 
+# 保存原状态码，等待后台作业，采证后逐项清理，并以原状态码退出。
+# 此函数永远保留共享 Bridge。
 cleanup() {
   local status=$?
   local namespace pid
 
+  # 防清理失败递归触发 trap；set +e 让其尽力处理全部对象。
   trap - ERR EXIT INT TERM
   set +e
   for pid in "${background_pids[@]}"; do
@@ -242,6 +266,7 @@ cleanup() {
       ip netns delete "${namespace}"
     fi
   done
+  # 失败且显式设置开关时才保留临时证据。
   if (( status == 0 )) || [[ ${KEEP_FAILURE_ARTIFACTS} != 1 ]]; then
     rm -rf -- "${WORK_DIR}"
   else
@@ -254,11 +279,13 @@ cleanup() {
   exit "${status}"
 }
 
+# ERR 负责定位，EXIT 负责收尾；INT/TERM 转换为惯用退出码。
 trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# stdout 必须恰好一个 CNI 1.1.0 Result，且包含 IPv4 default。
 assert_result_json() {
   local path=$1
 
@@ -271,6 +298,7 @@ assert_result_json() {
   ' "${path}" >/dev/null || fail "stdout is not one valid CNI 1.1.0 result: ${path}"
 }
 
+# 将 stderr 当 JSON Lines 解析，核对统一结构字段。
 assert_json_logs() {
   local path=$1
 
@@ -287,6 +315,7 @@ assert_json_logs() {
   ' "${path}" >/dev/null || fail "stderr contains malformed or incomplete JSON logs: ${path}"
 }
 
+# 从单一 Result 提取后续连通性/归属断言所需值。
 result_ip() {
   jq -er '.[0].ips[0].address | split("/")[0]' < <(jq -s '.' "$1")
 }
@@ -299,6 +328,7 @@ result_host_veth() {
     < <(jq -s '.' "$1")
 }
 
+# 从 sysfs/ip JSON 同时核验类型、UP、MTU 和 gateway。
 assert_bridge() {
   [[ -d /sys/class/net/${BRIDGE_NAME}/bridge ]] || fail "${BRIDGE_NAME} is not a Linux bridge"
   ip -j link show dev "${BRIDGE_NAME}" \
@@ -312,6 +342,7 @@ assert_bridge() {
     || fail "${BRIDGE_NAME} does not have 10.77.0.1/24"
 }
 
+# 跨 netns/host 验证 lo、eth0、地址、路由、master、alias 及 host 无 IPv4。
 assert_endpoint() {
   local namespace=$1
   local ip_address=$2
@@ -346,6 +377,7 @@ assert_endpoint() {
   || fail "${host_veth} unexpectedly has an IPv4 address"
 }
 
+# 释放后的 IP 必须从 allocations 反向映射消失。
 assert_state_ip_absent() {
   local ip_address=$1
 
@@ -355,6 +387,7 @@ assert_state_ip_absent() {
   fi
 }
 
+# 使用完整 endpoint identity 搜索，不依赖 map key 实现细节。
 assert_endpoint_state_absent() {
   local namespace=$1
   local if_name=${namespace_ifnames["${namespace}"]:-eth0}
@@ -379,6 +412,7 @@ assert_endpoint_state_absent() {
     || fail "endpoint state remains for ${namespace}/${if_name}"
 }
 
+# 故障注入后 CHECK 必须失败、stdout 为空且 stderr 有可操作诊断。
 expect_check_failure() {
   local namespace=$1
   local label=$2
@@ -393,6 +427,7 @@ expect_check_failure() {
     || fail "CHECK failure after ${label} was not diagnostic"
 }
 
+# 主流程先完成权限、命令、安装新鲜度与配置预检，再产生副作用。
 if (( EUID != 0 )); then
   fail 'integration-v1.sh requires root; run sudo make integration'
 fi
@@ -422,6 +457,7 @@ jq -e '
 (( CONCURRENCY >= 2 && CONCURRENCY <= 16 )) \
   || fail 'CLOUDNET_TEST_CONCURRENCY must be between 2 and 16'
 
+# A/B：ADD、重复 ADD、双 endpoint 连通，以及 Result/日志格式。
 CURRENT_PHASE='A/B ADD and connectivity'
 log 'A/B: ADD, idempotent ADD, bridge checks, and two-endpoint connectivity'
 ns_a="cloudnet-test-a-${RUN_ID}"
@@ -484,6 +520,7 @@ run_checked \
   "${WORK_DIR}/ping-host-b.out" \
   ping -c 2 -W 2 "${ip_b}"
 
+# C：注入 link、route、master 漂移，确认 CHECK 只报告而不修复。
 CURRENT_PHASE='C CHECK drift detection'
 log 'C: CHECK success and diagnosed topology drift'
 
@@ -516,6 +553,7 @@ ip link set dev "${host_a}" master "${BRIDGE_NAME}"
 ip link set dev "${host_a}" up
 check_endpoint "${ns_a}" >/dev/null
 
+# D：DEL 幂等、共享资源不受影响，以及最低地址可复用。
 CURRENT_PHASE='D DEL idempotency'
 log 'D: normal and repeated DEL while another endpoint remains healthy'
 delete_endpoint "${ns_a}"
@@ -548,6 +586,7 @@ delete_endpoint "${ns_reuse}"
 assert_state_ip_absent "${ip_reuse}"
 assert_endpoint_state_absent "${ns_reuse}"
 
+# E：覆盖 netns 先删除和空 CNI_NETNS 两种合法 DEL 场景。
 CURRENT_PHASE='E missing netns DEL'
 log 'E: namespace removal before DEL'
 ns_gone="cloudnet-test-gone-${RUN_ID}"
@@ -596,6 +635,7 @@ assert_state_ip_absent "${ip_empty}"
 assert_endpoint_state_absent "${ns_empty}"
 delete_endpoint "${ns_empty}"
 
+# F：预置 dummy eth0 制造冲突，验证 IP/veth 回滚且未知接口不受损。
 CURRENT_PHASE='F ADD rollback injection'
 log 'F: mid-ADD interface conflict rolls back allocation and veth'
 ns_fail="cloudnet-test-fail-${RUN_ID}"
@@ -615,6 +655,7 @@ ip link show dev "${fail_host}" >/dev/null 2>&1 && fail 'failed ADD leaked a hos
 ip -n "${ns_fail}" -d link show dev eth0 | grep -qw dummy \
   || fail 'failed ADD damaged the pre-existing dummy interface'
 
+# G：并发 ADD 验证地址唯一；并发 DEL 验证状态和链接全部释放。
 CURRENT_PHASE='G concurrent ADD and DEL'
 log "G: ${CONCURRENCY} concurrent ADD operations receive unique addresses"
 declare -a concurrent_namespaces=()
@@ -635,6 +676,7 @@ for pid in "${add_pids[@]}"; do
   wait "${pid}" || fail "concurrent ADD process ${pid} failed"
 done
 
+# 汇总并发 Result 后用 sort -u 检查地址唯一性。
 : >"${WORK_DIR}/concurrent-ips"
 for (( index = 0; index < CONCURRENCY; index++ )); do
   namespace=${concurrent_namespaces["${index}"]}

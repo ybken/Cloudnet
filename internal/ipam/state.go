@@ -17,6 +17,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// 文件与锁位于单网络目录。16 MiB 上限防止损坏文件造成无界读取；
+// StateVersion 用于显式拒绝未知 schema。
 const (
 	// StateVersion is the on-disk state schema understood by this binary.
 	StateVersion = 1
@@ -45,6 +47,8 @@ func (e *CorruptStateError) Error() string {
 
 func (e *CorruptStateError) Unwrap() error { return e.Err }
 
+// persistedState 是单网络一致性单元；Endpoints 与 Allocations 是必须同步
+// 更新并互相验证的双向映射。
 type persistedState struct {
 	Version     int                        `json:"version"`
 	NetworkName string                     `json:"networkName"`
@@ -66,6 +70,7 @@ type persistedNetworkConfig struct {
 	MTU        int    `json:"mtu"`
 }
 
+// newPersistedState 仅用于文件不存在的初始网络，不替代损坏文件。
 func newPersistedState(networkName string) persistedState {
 	return persistedState{
 		Version:     StateVersion,
@@ -75,6 +80,8 @@ func newPersistedState(networkName string) persistedState {
 	}
 }
 
+// loadState 限制大小、严格解码并验证全部不变量。仅 ENOENT 创建空状态；
+// 损坏文件原样保留并返回 CorruptStateError。
 func loadState(dir *os.File, path, networkName string) (persistedState, error) {
 	file, err := openRegularFileAt(dir, stateFile, path, unix.O_RDONLY, 0)
 	if errors.Is(err, unix.ENOENT) {
@@ -109,6 +116,8 @@ func loadState(dir *os.File, path, networkName string) (persistedState, error) {
 	return state, nil
 }
 
+// decodeStateJSON 拒绝重复 key、未知字段和尾随第二个 JSON 值，
+// 避免解析器的“最后值获胜”掩盖损坏。
 func decodeStateJSON(raw []byte, state *persistedState) error {
 	if err := checkUniqueStateJSON(raw); err != nil {
 		return err
@@ -128,6 +137,7 @@ func decodeStateJSON(raw []byte, state *persistedState) error {
 	return nil
 }
 
+// checkUniqueStateJSON 对完整 token 流递归检查每一层 object。
 func checkUniqueStateJSON(raw []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	if err := checkUniqueStateValue(decoder); err != nil {
@@ -142,6 +152,8 @@ func checkUniqueStateJSON(raw []byte) error {
 	return nil
 }
 
+// checkUniqueStateValue 消费一个 JSON 值，并在每个 object 作用域维护 key 集；
+// array 元素继续递归，所以嵌套对象同样不能重复 key。
 func checkUniqueStateValue(decoder *json.Decoder) error {
 	token, err := decoder.Token()
 	if err != nil {
@@ -197,6 +209,8 @@ func checkUniqueStateValue(decoder *json.Decoder) error {
 	return nil
 }
 
+// validatePersistedState 验证 schema、网络配置、每条 Record 和双向映射；
+// 读盘与写盘共同使用这套核心不变量。
 func validatePersistedState(state persistedState, networkName string) error {
 	if state.Version != StateVersion {
 		return fmt.Errorf("state version %d is unsupported (want %d)", state.Version, StateVersion)
@@ -255,6 +269,7 @@ func validatePersistedState(state persistedState, networkName string) error {
 	return nil
 }
 
+// allocationRange 将磁盘字符串恢复为经验证的 Range，并核验 Bridge/MTU。
 func (c persistedNetworkConfig) allocationRange() (Range, error) {
 	subnet, err := netip.ParsePrefix(c.Subnet)
 	if err != nil {
@@ -278,6 +293,7 @@ func (c persistedNetworkConfig) allocationRange() (Range, error) {
 	return NewRange(subnet, gateway, start, end)
 }
 
+// matchesRecord 确认 endpoint 没有偏离网络级固定配置。
 func (c persistedNetworkConfig) matchesRecord(record endpoint.Record) bool {
 	return c.Subnet == record.Subnet &&
 		c.Gateway == record.Gateway &&
@@ -289,6 +305,8 @@ func (c persistedNetworkConfig) matchesRecord(record endpoint.Record) bool {
 
 var renameStateFileAt = unix.Renameat
 
+// writeStateAtomic 执行“同目录临时文件 -> file fsync -> renameat -> dir fsync”。
+// rename 让读者只见旧版或完整新版，目录 fsync 保证重启后目录项持久。
 func writeStateAtomic(dir *os.File, path string, state persistedState) error {
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -334,6 +352,8 @@ func writeStateAtomic(dir *os.File, path string, state persistedState) error {
 	return nil
 }
 
+// createStateTemporary 使用随机名与 O_EXCL，避免并发碰撞和跟随已有条目；
+// 100 次是极端随机碰撞或目录污染时的有界重试。
 func createStateTemporary(dir *os.File, statePath string) (*os.File, string, error) {
 	for attempt := 0; attempt < 100; attempt++ {
 		var random [8]byte
@@ -359,6 +379,7 @@ func createStateTemporary(dir *os.File, statePath string) (*os.File, string, err
 	return nil, "", errors.New("create state temporary file: exhausted unique names")
 }
 
+// sortedRecords 消除 Go map 随机迭代顺序，按 containerID/ifName 稳定输出。
 func sortedRecords(records map[string]endpoint.Record) []endpoint.Record {
 	result := make([]endpoint.Record, 0, len(records))
 	for _, record := range records {

@@ -1,3 +1,5 @@
+// 本文件验证分类错误包装保留 cause/context，并保持 nil-in nil-out。
+// 测试名描述场景，子测试分别表达输入变化与期望结果。
 package errs
 
 import (

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
+# 采集应尽量继续，故不启用 -e；仍拒绝未定义变量并保留管道错误。
 set -uo pipefail
 
+# 为诊断报告添加稳定分隔标题，便于人工浏览。
 section() {
   printf '\n===== %s =====\n' "$1"
 }
 
+# 检查命令是否安装并合并输出；单项失败不会中断后续采集。
 run() {
   section "$*"
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -14,6 +17,7 @@ run() {
   "$@" 2>&1 || printf '[command exited non-zero: %s]\n' "$*"
 }
 
+# 只列三层元数据，不读取状态文件正文或潜在秘密。
 list_path() {
   local path=$1
 
@@ -26,6 +30,7 @@ list_path() {
     || printf '[unable to list %s]\n' "${path}"
 }
 
+# 第一组：工作区与工具版本，用于确认复现代码和运行环境。
 section 'pwd'
 pwd
 
@@ -52,16 +57,19 @@ else
   printf 'not installed\n'
 fi
 
+# 第二组：网络拓扑快照；所有命令都是只读查询。
 run ip -br addr
 run ip route
 run ip netns list
 run ip -d link
 run bridge link
 
+# 第三组：CNI 安装与 cloudnet 状态路径的权限、大小和时间戳。
 list_path /opt/cni/bin
 list_path /etc/cni/net.d
 list_path /var/lib/cloudnet
 
+# 防火墙与 forwarding 会影响连通性，但脚本只采集、不修改。
 run nft list ruleset
 run iptables-save
 
@@ -72,6 +80,7 @@ else
   printf 'unreadable\n'
 fi
 
+# 固定实验环境的管理网/underlay 核对，用于证明 cloudnet 未接管物理口。
 section 'interface carrying management address 192.168.80.135'
 ip -o -4 addr show 2>&1 \
   | awk '$4 ~ /^192[.]168[.]80[.]135\// { print $2, $4 }' \

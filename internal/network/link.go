@@ -7,6 +7,8 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// linkByName 把 netlink 的未找到异常规范化为 (nil, false, nil)，
+// 使调用方能区分幂等缺失和真正的内核查询失败。
 func linkByName(name string) (netlink.Link, bool, error) {
 	link, err := netlink.LinkByName(name)
 	if err == nil {
@@ -19,6 +21,8 @@ func linkByName(name string) (netlink.Link, bool, error) {
 	return nil, false, fmt.Errorf("look up link %q: %w", name, err)
 }
 
+// requireBridge 同时检查 Go 具体类型与内核 type 字符串，避免把同名普通链接
+// 当作 Bridge 继续执行 master 或地址操作。
 func requireBridge(name string) (*netlink.Bridge, error) {
 	link, found, err := linkByName(name)
 	if err != nil {

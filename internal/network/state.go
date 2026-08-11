@@ -7,6 +7,7 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// addressState 区分“可以补齐的缺失”和“必须停止的冲突”。
 type addressState uint8
 
 const (
@@ -23,7 +24,7 @@ func classifyIPv4Addresses(addresses []netlink.Addr, expected netip.Prefix) (add
 	for _, address := range addresses {
 		prefix, err := prefixFromIPNet(address.IPNet)
 		if err != nil {
-			// AddrList(FAMILY_V4) should never return a non-IPv4 address.
+			// FAMILY_V4 理论上不应返回非 IPv4；若发生则按冲突处理，绝不忽略。
 			return addressConflict, fmt.Errorf("inspect IPv4 address %v: %w", address, err)
 		}
 		ipv4Count++

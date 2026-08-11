@@ -1,3 +1,5 @@
+// 本文件验证补偿栈的 LIFO、普通失败继续、关键失败中止及 Commit 解除回滚。
+// 测试名描述场景，子测试分别表达输入变化与期望结果。
 package transaction
 
 import (

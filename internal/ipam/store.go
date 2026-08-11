@@ -14,17 +14,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// DefaultStateRoot 是生产状态根；测试通过 NewStore 注入临时目录。
 const DefaultStateRoot = "/var/lib/cloudnet"
 
 var networkNamePattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$`)
 
-// Store owns the root of all per-network state directories.
+// Store 持有所有网络状态目录的根路径；自身不缓存可变状态。
 type Store struct {
 	root string
 }
 
-// LockedStore is valid only during its Store.WithLock callback. All mutations
-// are in memory until Commit or successful callback completion.
+// LockedStore 只在 WithLock callback 期间有效。变更先发生在内存副本中，
+// Commit 或 callback 正常结束时才原子写盘；active 防止对象逃逸后继续使用。
 type LockedStore struct {
 	networkName string
 	statePath   string
@@ -34,13 +35,15 @@ type LockedStore struct {
 	active      bool
 }
 
-// AllocationRequest reserves an address and creates a pending endpoint record.
-// ContainerIP, range fields, phase, and timestamps are filled by Allocate.
+// AllocationRequest 只携带调用方负责的身份/网络元数据。ContainerIP、range、
+// phase 和时间戳由 Allocate 填写，避免调用方伪造 Store 管理字段。
 type AllocationRequest struct {
 	Endpoint endpoint.Record
 	Range    Range
 }
 
+// NewStore 将 root 转成清理后的绝对路径；真正的防 symlink 打开延迟到 WithLock，
+// 因而构造 Store 本身不会产生文件系统副作用。
 func NewStore(root string) (*Store, error) {
 	if root == "" {
 		return nil, fmt.Errorf("state root is empty")
@@ -62,6 +65,8 @@ func ValidateNetworkName(name string) error {
 	return nil
 }
 
+// networkDir 先保证网络名只能成为一个安全路径组件；安全打开并不依赖
+// 拼接后的字符串，而由 securefs 的 fd-relative openat 完成。
 func (s *Store) networkDir(networkName string) (string, error) {
 	if s == nil {
 		return "", fmt.Errorf("state store is nil")
@@ -72,6 +77,7 @@ func (s *Store) networkDir(networkName string) (string, error) {
 	return filepath.Join(s.root, "networks", networkName), nil
 }
 
+// StatePath 返回用于日志和诊断的 state.json 路径。
 func (s *Store) StatePath(networkName string) (string, error) {
 	dir, err := s.networkDir(networkName)
 	if err != nil {
@@ -80,6 +86,7 @@ func (s *Store) StatePath(networkName string) (string, error) {
 	return filepath.Join(dir, stateFile), nil
 }
 
+// LockPath 返回永久 .lock 文件的展示路径。
 func (s *Store) LockPath(networkName string) (string, error) {
 	dir, err := s.networkDir(networkName)
 	if err != nil {
@@ -88,9 +95,9 @@ func (s *Store) LockPath(networkName string) (string, error) {
 	return filepath.Join(dir, lockFile), nil
 }
 
-// WithLock holds a process-level exclusive flock for the callback's entire
-// duration. A successful callback auto-commits dirty state. A failing callback
-// does not commit mutations that were not explicitly committed already.
+// WithLock 在 callback 全程持有进程级独占 flock。callback 成功会自动提交 dirty
+// 状态；失败则丢弃尚未显式 Commit 的内存变更。ADD 的显式 Commit 可先落 pending，
+// 这是刻意跨越 callback 失败边界的崩溃恢复点。
 func (s *Store) WithLock(networkName string, callback func(*LockedStore) error) error {
 	if callback == nil {
 		return fmt.Errorf("state lock callback is nil")
@@ -142,6 +149,7 @@ func (s *Store) WithLock(networkName string, callback func(*LockedStore) error) 
 	return nil
 }
 
+// flockExclusive 遇到信号中断 EINTR 就重试，其他错误原样返回。
 func flockExclusive(file *os.File) error {
 	for {
 		err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX)
@@ -151,6 +159,7 @@ func flockExclusive(file *os.File) error {
 	}
 }
 
+// ensureActive 阻止 callback 结束后继续访问已失去锁保护的状态副本。
 func (s *LockedStore) ensureActive() error {
 	if s == nil || !s.active {
 		return ErrLockedStoreClosed
@@ -158,8 +167,8 @@ func (s *LockedStore) ensureActive() error {
 	return nil
 }
 
-// Commit durably writes current mutations while retaining the flock. This is
-// how ADD records pending state before beginning namespace and veth work.
+// Commit 在继续持锁时持久写入变更。ADD 借此在 namespace/veth 工作前先记录
+// pending；dirty=false 时是 no-op，便于 WithLock 无条件收尾调用。
 func (s *LockedStore) Commit() error {
 	if err := s.ensureActive(); err != nil {
 		return err
@@ -178,6 +187,8 @@ func (s *LockedStore) Commit() error {
 	return nil
 }
 
+// Allocate 为新 endpoint 选择最低可用 IP 并创建 pending；同一 key 重试会
+// 验证不可变字段并返回原记录。第二个返回值表示这次是否新建。
 func (s *LockedStore) Allocate(request AllocationRequest) (endpoint.Record, bool, error) {
 	if err := s.ensureActive(); err != nil {
 		return endpoint.Record{}, false, err
@@ -237,6 +248,7 @@ func (s *LockedStore) Allocate(request AllocationRequest) (endpoint.Record, bool
 	return record, true, nil
 }
 
+// networkConfigFromRequest 提取所有 endpoint 共享的网络级不变量。
 func networkConfigFromRequest(request AllocationRequest) persistedNetworkConfig {
 	return persistedNetworkConfig{
 		Subnet:     request.Range.Subnet().String(),
@@ -248,6 +260,7 @@ func networkConfigFromRequest(request AllocationRequest) persistedNetworkConfig 
 	}
 }
 
+// validateRequest 划清调用方与 Store 的字段所有权，并核对持锁网络身份。
 func validateRequest(request AllocationRequest, networkName string) error {
 	key := request.Endpoint.EndpointKey()
 	if err := key.Validate(); err != nil {
@@ -278,6 +291,8 @@ func validateRequest(request AllocationRequest, networkName string) error {
 	return nil
 }
 
+// matchesRequest 是幂等复用的守门条件；netns/时间戳可变，其余身份与
+// 网络字段必须精确一致，原 IP 也必须仍在 range 中。
 func matchesRequest(existing endpoint.Record, request AllocationRequest) error {
 	want := request.Endpoint
 	want.Subnet = request.Range.Subnet().String()
@@ -300,6 +315,7 @@ func matchesRequest(existing endpoint.Record, request AllocationRequest) error {
 	return nil
 }
 
+// GetEndpoint 在锁内按稳定 SHA-256 key 查询 endpoint。
 func (s *LockedStore) GetEndpoint(key endpoint.Key) (endpoint.Record, bool, error) {
 	if err := s.ensureActive(); err != nil {
 		return endpoint.Record{}, false, err
@@ -314,6 +330,7 @@ func (s *LockedStore) GetEndpoint(key endpoint.Key) (endpoint.Record, bool, erro
 	return record, ok, nil
 }
 
+// ListEndpoints 返回确定性排序副本，便于诊断和测试稳定比较。
 func (s *LockedStore) ListEndpoints() ([]endpoint.Record, error) {
 	if err := s.ensureActive(); err != nil {
 		return nil, err
@@ -321,9 +338,8 @@ func (s *LockedStore) ListEndpoints() ([]endpoint.Record, error) {
 	return sortedRecords(s.state.Endpoints), nil
 }
 
-// MarkPending records that an existing endpoint is about to be reconciled.
-// Persisting this transition before destructive network work makes a process
-// interruption recoverable by the next ADD or DEL. The operation is idempotent.
+// MarkPending 表示已有 endpoint 即将被协调。破坏性网络操作前持久化这一迁移，
+// 进程中断后下一次 ADD/DEL 才知道需要恢复；重复标记是 no-op。
 func (s *LockedStore) MarkPending(key endpoint.Key) (endpoint.Record, error) {
 	record, ok, err := s.GetEndpoint(key)
 	if err != nil {
@@ -342,7 +358,7 @@ func (s *LockedStore) MarkPending(key endpoint.Key) (endpoint.Record, error) {
 	return record, nil
 }
 
-// MarkReady is idempotent.
+// MarkReady 只在网络创建和复核成功后调用；重复标记是 no-op。
 func (s *LockedStore) MarkReady(key endpoint.Key) (endpoint.Record, error) {
 	record, ok, err := s.GetEndpoint(key)
 	if err != nil {
@@ -361,8 +377,8 @@ func (s *LockedStore) MarkReady(key endpoint.Key) (endpoint.Record, error) {
 	return record, nil
 }
 
-// Release removes an endpoint and its address in one state mutation. Missing
-// endpoints are successful no-ops, making DEL naturally idempotent.
+// Release 在同一变更中删除 endpoint 和反向 allocation。缺失是成功 no-op；
+// 双向映射不一致则报告损坏，不“修复”并覆盖证据。
 func (s *LockedStore) Release(key endpoint.Key) (endpoint.Record, bool, error) {
 	record, ok, err := s.GetEndpoint(key)
 	if err != nil {

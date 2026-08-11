@@ -1,3 +1,5 @@
+// 本文件以 fake NetworkOps 驱动 ADD/CHECK/DEL 编排，重点验证幂等、恢复顺序、critical 回滚屏障和日志，不依赖 root。
+// 测试名描述场景，子测试分别表达输入变化与期望结果。
 package cni
 
 import (

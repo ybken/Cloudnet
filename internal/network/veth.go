@@ -7,12 +7,16 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// CreateEndpoint 创建带所有权 alias 的 veth pair，把 peer 移入容器 netns，
+// 配置两端并将 host 端接入 Bridge。
+//
 // CreateEndpoint creates, moves, configures, and attaches one owned veth pair.
 // Any failure after LinkAdd removes that exact newly-created pair.
 func CreateEndpoint(spec EndpointSpec) error {
 	if err := validateEndpointSpec(spec); err != nil {
 		return fmt.Errorf("invalid endpoint configuration: %w", err)
 	}
+	// 先验证前置资源与名称冲突，尽量让失败发生在 LinkAdd 之前。
 	bridge, err := requireBridge(spec.BridgeName)
 	if err != nil {
 		return err
@@ -33,6 +37,7 @@ func CreateEndpoint(spec EndpointSpec) error {
 		}
 	}
 
+	// LinkAdd 是本函数开始产生内核副作用的边界。
 	attrs := netlink.NewLinkAttrs()
 	attrs.Name = spec.HostVethName
 	attrs.MTU = spec.MTU
@@ -40,6 +45,8 @@ func CreateEndpoint(spec EndpointSpec) error {
 	if err := netlink.LinkAdd(pair); err != nil {
 		return fmt.Errorf("veth create failed for %q/%q: %w", spec.HostVethName, spec.PeerVethName, err)
 	}
+	// fail 统一清理本次 pair；删除任一端会让内核同步删除另一端。
+	// LinkDel 报错但随后确认链接已消失时，仍视为清理完成。
 	var createdHost netlink.Link
 	fail := func(original error) error {
 		target := createdHost
@@ -78,6 +85,8 @@ func CreateEndpoint(spec EndpointSpec) error {
 		}
 		return fail(err)
 	}
+	// 两端显式设置 MTU 和 alias；不能假设创建参数或 namespace 移动会同步值。
+	// 相同 alias 使任一端都能独立证明 endpoint 所有权。
 	if err := netlink.LinkSetMTU(host, spec.MTU); err != nil {
 		return fail(fmt.Errorf("set host veth %q MTU: %w", spec.HostVethName, err))
 	}
@@ -90,6 +99,9 @@ func CreateEndpoint(spec EndpointSpec) error {
 	if err := netlink.LinkSetAlias(peer, spec.Alias); err != nil {
 		return fail(fmt.Errorf("set peer veth %q ownership alias: %w", spec.PeerVethName, err))
 	}
+	// netlink setter 不更新传入的 LinkAttrs 快照；按名称重新读取后，
+	// 才能确认内核确实保存 alias，陈旧快照不能用于破坏性操作。
+	//
 	// Netlink setters do not update the LinkAttrs snapshot passed to them.
 	// Reload both ends so ownership checks observe what the kernel committed.
 	host, err = reloadOwnedVeth(spec.HostVethName, spec.Alias)
@@ -101,9 +113,12 @@ func CreateEndpoint(spec EndpointSpec) error {
 	if err != nil {
 		return fail(err)
 	}
+	// 移动后 peer 从当前 namespace 消失，只能通过 netNS.Do 再访问。
 	if err := netlink.LinkSetNsFd(peer, int(netNS.Fd())); err != nil {
 		return fail(fmt.Errorf("move peer %q to netns %q: %w", spec.PeerVethName, spec.NetNSPath, err))
 	}
+	// 移动 peer 会改变 pair 状态，所以挂 Bridge 前再次刷新 host 快照。
+	//
 	// Moving the peer changes link state. Refresh the host again instead of
 	// relying on the pre-move snapshot for the destructive work that follows.
 	host, err = reloadOwnedVeth(spec.HostVethName, spec.Alias)
@@ -126,8 +141,10 @@ func CreateEndpoint(spec EndpointSpec) error {
 	return nil
 }
 
+// linkLookupFunc 让刷新/验权逻辑可在无特权测试中注入 fake lookup。
 type linkLookupFunc func(string) (netlink.Link, bool, error)
 
+// reloadOwnedVeth 从内核重新读取并验证指定 veth 的所有权。
 func reloadOwnedVeth(name, expectedAlias string) (netlink.Link, error) {
 	return reloadOwnedVethWith(name, expectedAlias, linkByName)
 }

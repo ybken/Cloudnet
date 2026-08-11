@@ -1,3 +1,5 @@
+// 本文件覆盖地址池边界、gateway/保留地址排除、IPv4 最大值终止和非法 range。
+// 测试名描述场景，子测试分别表达输入变化与期望结果。
 package ipam_test
 
 import (

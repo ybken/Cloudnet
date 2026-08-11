@@ -1,3 +1,5 @@
+// 本文件用表驱动场景验证 prevResult 的接口、IPv4、gateway、default route 规范化及具体 mismatch 诊断。
+// 测试名描述场景，子测试分别表达输入变化与期望结果。
 package cni
 
 import (

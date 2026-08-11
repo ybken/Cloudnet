@@ -1,3 +1,5 @@
+// 本文件构造内存中的 link 拓扑，验证 Bridge 只接受本网络完整 alias 的 veth 端口。
+// 测试名描述场景，子测试分别表达输入变化与期望结果。
 package network
 
 import (

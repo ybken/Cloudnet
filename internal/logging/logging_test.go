@@ -1,3 +1,5 @@
+// 本文件验证 stderr JSON 日志的级别过滤、字段 schema、敏感/超长值截断和 containerID 缩写。
+// 测试名描述场景，子测试分别表达输入变化与期望结果。
 package logging
 
 import (

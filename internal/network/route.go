@@ -8,6 +8,8 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// validateDefaultRoute 要求恰好一条 IPv4 default，且 gateway 与接口索引匹配。
+// 多条“也能工作”的 default 仍属于不可预测的状态漂移。
 func validateDefaultRoute(routes []netlink.Route, gateway netip.Addr, linkIndex int) error {
 	defaults := make([]netlink.Route, 0, 1)
 	for _, route := range routes {
@@ -35,6 +37,7 @@ func validateDefaultRoute(routes []netlink.Route, gateway netip.Addr, linkIndex 
 	return nil
 }
 
+// isIPv4DefaultRoute 同时识别 nil Dst 与显式 IPv4 /0。
 func isIPv4DefaultRoute(route netlink.Route) bool {
 	if route.Dst == nil {
 		return true
@@ -43,6 +46,8 @@ func isIPv4DefaultRoute(route netlink.Route) bool {
 	return ones == 0 && bits == 32
 }
 
+// addDefaultRoute 发现已有默认路由就停止，不覆盖 runtime 或其他插件的路由。
+// 成功创建的 route 显式绑定容器接口索引。
 func addDefaultRoute(link netlink.Link, gateway netip.Addr) error {
 	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
 	if err != nil {

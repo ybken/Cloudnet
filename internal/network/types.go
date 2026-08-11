@@ -1,3 +1,5 @@
+// Package network 封装 Linux Bridge、veth、network namespace、IPv4 地址和路由；
+// IP 分配与磁盘事务分别留给 ipam 和 cni 包。
 package network
 
 import (
@@ -9,6 +11,7 @@ import (
 	"strings"
 )
 
+// 下列边界来自 IPv4 最小 MTU、Linux MTU 上限和接口 alias 上限。
 const (
 	minimumIPv4MTU = 576
 	maximumMTU     = 65535
@@ -49,6 +52,8 @@ type DeleteSpec struct {
 	Alias        string
 }
 
+// validateBridgeSpec 在 netlink 调用前拒绝不安全或自相矛盾的参数，
+// 防止其他包或测试绕过 config 后误操作内核对象。
 func validateBridgeSpec(spec BridgeSpec) error {
 	if !ownershipNetworkNamePattern.MatchString(spec.NetworkName) {
 		return fmt.Errorf("network name %q is not safe for ownership matching", spec.NetworkName)
@@ -77,6 +82,8 @@ func validateBridgeSpec(spec BridgeSpec) error {
 	return validateMTU(spec.MTU)
 }
 
+// validateEndpointSpec 验证名称互异、地址/网关关系及 netns 路径，
+// 确保后续步骤不会覆盖已有接口或创建不可路由的 endpoint。
 func validateEndpointSpec(spec EndpointSpec) error {
 	if err := validateInterfaceName("bridge name", spec.BridgeName); err != nil {
 		return err
@@ -110,6 +117,7 @@ func validateEndpointSpec(spec EndpointSpec) error {
 	if !spec.Gateway.IsValid() || !spec.Gateway.Is4() {
 		return fmt.Errorf("endpoint gateway must be a valid IPv4 address")
 	}
+	// Masked 得到网络地址，用于排除 network/broadcast 等保留地址。
 	network := spec.Address.Masked()
 	if !network.Contains(spec.Gateway) {
 		return fmt.Errorf("endpoint gateway %s is outside address prefix %s", spec.Gateway, spec.Address)
@@ -126,6 +134,8 @@ func validateEndpointSpec(spec EndpointSpec) error {
 	return validateMTU(spec.MTU)
 }
 
+// validateDeleteSpec 允许空 netns，但名称与 alias 必须完整；破坏性操作
+// 即使处于 DEL 的恢复路径，也不能放松所有权条件。
 func validateDeleteSpec(spec DeleteSpec) error {
 	if err := validateInterfaceName("host veth name", spec.HostVethName); err != nil {
 		return err
@@ -143,6 +153,8 @@ func validateDeleteSpec(spec DeleteSpec) error {
 	return nil
 }
 
+// validateInterfaceName 执行 Linux IFNAMSIZ-1 的 15 字节上限，并拒绝可能
+// 混入路径或 namespace 语义的分隔字符。
 func validateInterfaceName(label, name string) error {
 	if name == "" {
 		return fmt.Errorf("%s is required", label)
@@ -156,6 +168,7 @@ func validateInterfaceName(label, name string) error {
 	return nil
 }
 
+// validateMTU 将 MTU 限制在 IPv4 与 Linux 接口均可接受的范围。
 func validateMTU(mtu int) error {
 	if mtu < minimumIPv4MTU || mtu > maximumMTU {
 		return fmt.Errorf("MTU %d is outside supported range %d..%d", mtu, minimumIPv4MTU, maximumMTU)
@@ -163,6 +176,8 @@ func validateMTU(mtu int) error {
 	return nil
 }
 
+// isIPv4Broadcast 把 host bits 全置 1 后比较；/0 单独处理，
+// 避免右移 32 位的边界问题。
 func isIPv4Broadcast(addr netip.Addr, subnet netip.Prefix) bool {
 	if !addr.Is4() || !subnet.IsValid() || !subnet.Addr().Is4() {
 		return false
@@ -184,6 +199,8 @@ func isIPv4Broadcast(addr netip.Addr, subnet netip.Prefix) bool {
 	return address == network|hostMask
 }
 
+// ipNetFromPrefix 在不可变 netip 与 netlink 使用的 net.IPNet 间转换，
+// 并复制 IP slice，避免共享可变内存。
 func ipNetFromPrefix(prefix netip.Prefix) *net.IPNet {
 	addr := prefix.Addr().Unmap()
 	bits := 128
@@ -196,6 +213,7 @@ func ipNetFromPrefix(prefix netip.Prefix) *net.IPNet {
 	}
 }
 
+// prefixFromIPNet 只接受规范 CIDR mask 的 IPv4 net.IPNet。
 func prefixFromIPNet(network *net.IPNet) (netip.Prefix, error) {
 	if network == nil {
 		return netip.Prefix{}, fmt.Errorf("nil IP network")
@@ -211,6 +229,7 @@ func prefixFromIPNet(network *net.IPNet) (netip.Prefix, error) {
 	return netip.PrefixFrom(addr.Unmap(), ones), nil
 }
 
+// addrFromIP 把 IPv4-mapped 表示规范化为纯 IPv4 netip.Addr。
 func addrFromIP(ip net.IP) (netip.Addr, error) {
 	addr, ok := netip.AddrFromSlice(ip)
 	if !ok {

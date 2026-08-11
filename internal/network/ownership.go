@@ -6,6 +6,8 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// verifyOwnedLink 要求 alias 完整相等。短接口名只能定位，不能作为删除授权，
+// 因为名称可能碰撞或被其他程序复用。
 func verifyOwnedLink(attrs *netlink.LinkAttrs, expectedAlias string) error {
 	if attrs == nil {
 		return fmt.Errorf("veth ownership check: missing link attributes")

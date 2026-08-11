@@ -1,3 +1,5 @@
+// 本文件覆盖 Bridge/Endpoint 参数不变量及 netip 与 net.IPNet 的往返转换。
+// 测试名描述场景，子测试分别表达输入变化与期望结果。
 package network
 
 import (
